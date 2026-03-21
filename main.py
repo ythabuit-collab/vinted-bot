@@ -915,7 +915,6 @@ def main():
         print("     → console.anthropic.com → API Keys → Create Key\n")
         return
  
-    global VISION_ENABLED
     if VISION_ENABLED and "COLLE" in ANTHROPIC_API_KEY:
         print("⚠️  Clé Anthropic manquante → Vision IA désactivée\n")
         VISION_ENABLED = False
