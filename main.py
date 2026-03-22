@@ -6,9 +6,9 @@ TELEGRAM_TOKEN   = "8611988792:AAGOJ7xDWPRJveS0jOe71NH5rWczdKwPUgI"
 TELEGRAM_CHAT_ID = "8559815820"
  
 BUDGET_MAX     = 60
-RATIO_MIN      = 4.0
+RATIO_MIN      = 2.5
 CHECK_INTERVAL = 55
-MIN_GAIN       = 50
+MIN_GAIN       = 40
  
 # ── Seuils d'analyse vendeur ──────────────────────────────
 MAX_LUXURY_RATIO     = 0.30   # Si +30% de ses articles sont du luxe → suspect
