@@ -1,22 +1,39 @@
 import requests
 import time
 from datetime import datetime
- 
+
 TELEGRAM_TOKEN   = "8611988792:AAGOJ7xDWPRJveS0jOe71NH5rWczdKwPUgI"
 TELEGRAM_CHAT_ID = "8559815820"
- 
+
 BUDGET_MAX     = 60
 RATIO_MIN      = 2.5
 CHECK_INTERVAL = 55
 MIN_GAIN       = 40
- 
-# ── Seuils d'analyse vendeur ──────────────────────────────
-MAX_LUXURY_RATIO     = 0.30   # Si +30% de ses articles sont du luxe → suspect
-MIN_SELLER_ITEMS     = 3      # Moins de 3 articles = pas assez de données
-MAX_AVG_PRICE        = 80     # Si son prix moyen dépasse 80€ → revendeur pro suspect
-MIN_FEEDBACK_SCORE   = 4.0    # Note minimale du vendeur (sur 5)
-MAX_LUXURY_IN_LAST10 = 3      # Max 3 articles luxe dans ses 10 derniers = ok
- 
+
+# ── Pays surveillés ───────────────────────────────────────
+VINTED_COUNTRIES = {
+    "🇫🇷 France":      "https://www.vinted.fr",
+    "🇧🇪 Belgique":    "https://www.vinted.be",
+    "🇳🇱 Pays-Bas":    "https://www.vinted.nl",
+    "🇪🇸 Espagne":     "https://www.vinted.es",
+    "🇩🇪 Allemagne":   "https://www.vinted.de",
+    "🇮🇹 Italie":      "https://www.vinted.it",
+}
+
+# Mots-clés traduits par pays pour les marques non-anglophones
+KEYWORD_TRANSLATIONS = {
+    "veste":    {"de": "jacke",    "es": "chaqueta", "it": "giacca",   "nl": "jas"},
+    "hoodie":   {"de": "hoodie",   "es": "sudadera",  "it": "felpa",    "nl": "hoodie"},
+    "pull":     {"de": "pullover", "es": "jersey",    "it": "maglione", "nl": "trui"},
+    "manteau":  {"de": "mantel",   "es": "abrigo",    "it": "cappotto", "nl": "jas"},
+    "sac":      {"de": "tasche",   "es": "bolso",     "it": "borsa",    "nl": "tas"},
+}
+
+# ── Seuils analyse vendeur ────────────────────────────────
+MAX_LUXURY_RATIO  = 0.30
+MAX_AVG_PRICE     = 80
+MIN_FEEDBACK_SCORE= 4.0
+
 LUXURY_BRAND_KEYWORDS = [
     "bottega", "balenciaga", "gucci", "prada", "burberry",
     "louis vuitton", "lv", "vuitton", "dior", "christian dior",
@@ -26,15 +43,28 @@ LUXURY_BRAND_KEYWORDS = [
     "fendi", "loewe", "acne studios", "maison margiela", "margiela",
     "rick owens", "fear of god", "essentials", "kenzo", "isabel marant",
 ]
- 
+
 CONDITION_COEFFS = {
     "neuf avec etiquette": 1.00, "neuf sans etiquette": 0.90,
     "tres bon etat": 0.75,       "bon etat": 0.60,
     "satisfaisant": 0.40,        "neuf": 0.95,
     "tres bon": 0.75,            "bon": 0.60,
+    # Allemand
+    "neu mit etikett": 1.00,     "neu ohne etikett": 0.90,
+    "sehr gut": 0.75,            "gut": 0.60,
+    "befriedigend": 0.40,
+    # Espagnol
+    "nuevo con etiqueta": 1.00,  "nuevo sin etiqueta": 0.90,
+    "muy bueno": 0.75,           "bueno": 0.60,
+    # Italien
+    "nuovo con etichetta": 1.00, "ottimo": 0.75,
+    "buono": 0.60,
+    # Néerlandais
+    "nieuw met label": 1.00,     "zeer goed": 0.75,
+    "goed": 0.60,
     "default": 0.65,
 }
- 
+
 BRANDS = {
     "Bottega Veneta": {
         "keywords": ["bottega veneta", "bottega"],
@@ -71,9 +101,8 @@ BRANDS = {
         "min_price": 15,
         "retail": {
             "sac nylon": 900, "sac re-nylon": 1200, "sac": 1500,
-            "sneaker": 800, "tshirt": 400, "polo": 500,
-            "pull": 900, "veste": 1800, "casquette": 350,
-            "portefeuille": 500, "ceinture": 450,
+            "sneaker": 800, "tshirt": 400, "pull": 900,
+            "veste": 1800, "casquette": 350, "portefeuille": 500,
         }
     },
     "Burberry": {
@@ -102,7 +131,6 @@ BRANDS = {
             "b23": 1100, "b22": 1200, "sneaker": 1100,
             "sac": 2000, "tshirt": 450, "hoodie": 1200,
             "pull": 900, "veste": 2500, "casquette": 400,
-            "ceinture": 450, "portefeuille": 600,
         }
     },
     "Stone Island": {
@@ -246,170 +274,151 @@ BRANDS = {
         }
     },
 }
- 
-FAKE_SIGNALS = ["replica", "rep", "aaa", "inspired", "no name"]
- 
-# ── Cache vendeurs (évite de re-analyser le même vendeur) ──
-seller_cache = {}
- 
-VINTED_SESSION = requests.Session()
-VINTED_SESSION.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "fr-FR,fr;q=0.9",
-    "Origin": "https://www.vinted.fr",
-    "Referer": "https://www.vinted.fr/",
-})
- 
-def init_vinted_session():
-    try:
-        VINTED_SESSION.get("https://www.vinted.fr", timeout=10)
-    except Exception as e:
-        print(f"[ERREUR] Session : {e}")
- 
-def search_vinted(keyword, max_price=None):
-    params = {"search_text": keyword, "order": "newest_first", "per_page": 48, "currency": "EUR"}
+
+FAKE_SIGNALS = ["replica", "rep", "aaa", "inspired", "no name", "contrefacon"]
+
+# ── Sessions par pays ─────────────────────────────────────
+country_sessions = {}
+
+def get_session(base_url):
+    if base_url not in country_sessions:
+        s = requests.Session()
+        s.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
+            "Origin": base_url,
+            "Referer": base_url + "/",
+        })
+        try:
+            s.get(base_url, timeout=10)
+        except:
+            pass
+        country_sessions[base_url] = s
+    return country_sessions[base_url]
+
+def init_all_sessions():
+    print("[INFO] Initialisation des sessions par pays...")
+    for country, base_url in VINTED_COUNTRIES.items():
+        try:
+            s = get_session(base_url)
+            print(f"  {country} ✓")
+        except Exception as e:
+            print(f"  {country} ✗ ({e})")
+        time.sleep(1)
+
+def search_vinted_country(base_url, keyword, max_price=None):
+    session = get_session(base_url)
+    params  = {
+        "search_text": keyword,
+        "order":       "newest_first",
+        "per_page":    48,
+        "currency":    "EUR",
+    }
     if max_price:
         params["price_to"] = max_price
     try:
-        r = VINTED_SESSION.get("https://www.vinted.fr/api/v2/catalog/items", params=params, timeout=12)
+        r = session.get(f"{base_url}/api/v2/catalog/items", params=params, timeout=12)
         if r.status_code == 200:
             return r.json().get("items", [])
         elif r.status_code == 401:
-            init_vinted_session()
+            session.get(base_url, timeout=10)
         return []
     except Exception as e:
-        print(f"  [Vinted] '{keyword}' : {e}")
+        print(f"  [{base_url}] '{keyword}' : {e}")
         return []
- 
-# ════════════════════════════════════════════════════════
-#  🔍  ANALYSE PROFIL VENDEUR
-# ════════════════════════════════════════════════════════
- 
-def fetch_seller_items(seller_id):
-    """Récupère les derniers articles du vendeur."""
-    try:
-        r = VINTED_SESSION.get(
-            f"https://www.vinted.fr/api/v2/users/{seller_id}/items",
-            params={"per_page": 20, "order": "newest_first"},
-            timeout=10
-        )
-        if r.status_code == 200:
-            return r.json().get("items", [])
-    except Exception as e:
-        print(f"  [Vendeur] Erreur fetch items {seller_id}: {e}")
-    return []
- 
-def fetch_seller_profile(seller_id):
-    """Récupère le profil complet du vendeur."""
-    try:
-        r = VINTED_SESSION.get(
-            f"https://www.vinted.fr/api/v2/users/{seller_id}",
-            timeout=10
-        )
-        if r.status_code == 200:
-            return r.json().get("user", {})
-    except Exception as e:
-        print(f"  [Vendeur] Erreur fetch profile {seller_id}: {e}")
-    return {}
- 
+
+# ── Analyse vendeur ───────────────────────────────────────
+seller_cache = {}
+
 def is_luxury_title(title):
-    """Vérifie si un titre contient une marque de luxe."""
     t = title.lower()
     return any(kw in t for kw in LUXURY_BRAND_KEYWORDS)
- 
-def analyze_seller(seller_id):
-    """
-    Analyse le profil vendeur.
-    Retourne (is_good_seller, score, reason)
-    """
-    # Cache pour ne pas re-analyser
-    if seller_id in seller_cache:
-        return seller_cache[seller_id]
- 
-    profile = fetch_seller_profile(seller_id)
-    if not profile:
-        result = (True, 50, "profil non disponible")
-        seller_cache[seller_id] = result
+
+def analyze_seller(base_url, seller_id):
+    cache_key = f"{base_url}_{seller_id}"
+    if cache_key in seller_cache:
+        return seller_cache[cache_key]
+
+    session = get_session(base_url)
+    profile = {}
+    items   = []
+
+    try:
+        r = session.get(f"{base_url}/api/v2/users/{seller_id}", timeout=10)
+        if r.status_code == 200:
+            profile = r.json().get("user", {})
+        time.sleep(0.5)
+        r2 = session.get(f"{base_url}/api/v2/users/{seller_id}/items",
+                         params={"per_page": 20, "order": "newest_first"}, timeout=10)
+        if r2.status_code == 200:
+            items = r2.json().get("items", [])
+    except Exception as e:
+        print(f"  [Vendeur] {seller_id}: {e}")
+        result = (True, 60, "profil non disponible")
+        seller_cache[cache_key] = result
         return result
- 
-    time.sleep(0.5)  # Délai poli
-    items = fetch_seller_items(seller_id)
- 
-    # ── Données de base ──
-    feedback_score    = float(profile.get("feedback_reputation", 1) or 1)
-    total_items_count = int(profile.get("items_count", 0) or 0)
-    feedback_count    = int(profile.get("positive_feedback_count", 0) or 0)
- 
-    # ── Analyse des articles ──
+
     if not items:
-        result = (True, 60, "vendeur sans historique visible")
-        seller_cache[seller_id] = result
+        result = (True, 60, "historique vide")
+        seller_cache[cache_key] = result
         return result
- 
-    prices        = []
-    luxury_count  = 0
-    normal_count  = 0
- 
+
+    feedback_score = float(profile.get("feedback_reputation", 1) or 1)
+    total_items    = int(profile.get("items_count", 0) or 0)
+    feedback_count = int(profile.get("positive_feedback_count", 0) or 0)
+
+    prices       = []
+    luxury_count = 0
+    normal_count = 0
+
     for it in items:
         try:
             p = float(it.get("price", {}).get("amount", 0))
             if p > 0:
                 prices.append(p)
-            title = it.get("title", "")
-            if is_luxury_title(title):
+            if is_luxury_title(it.get("title", "")):
                 luxury_count += 1
             else:
                 normal_count += 1
         except:
             pass
- 
-    total_analyzed = len(items)
-    avg_price      = sum(prices) / len(prices) if prices else 0
-    luxury_ratio   = luxury_count / total_analyzed if total_analyzed > 0 else 0
- 
-    # ── Scoring (0 = mauvais, 100 = parfait) ──
+
+    avg_price     = sum(prices) / len(prices) if prices else 0
+    luxury_ratio  = luxury_count / len(items) if items else 0
+
     score  = 100
     reason = []
- 
-    # Note vendeur faible
+
     if feedback_score < MIN_FEEDBACK_SCORE:
         score -= 40
-        reason.append(f"note faible ({feedback_score}/5)")
- 
-    # Trop de luxe dans son historique = revendeur pro ou faux
+        reason.append(f"note {feedback_score}/5")
+
     if luxury_ratio > MAX_LUXURY_RATIO:
         score -= 50
-        reason.append(f"trop de luxe ({int(luxury_ratio*100)}% de ses articles)")
- 
-    # Prix moyen très élevé = revendeur pro suspect
+        reason.append(f"{int(luxury_ratio*100)}% luxe dans son profil")
+
     if avg_price > MAX_AVG_PRICE:
         score -= 20
-        reason.append(f"prix moyen élevé ({avg_price:.0f}€)")
- 
-    # Beaucoup d'articles avec peu de feedback = compte suspect
-    if total_items_count > 50 and feedback_count < 5:
+        reason.append(f"prix moyen {avg_price:.0f}€")
+
+    if total_items > 50 and feedback_count < 5:
         score -= 30
-        reason.append(f"beaucoup d'articles ({total_items_count}) peu de feedback")
- 
-    # Profil positif : prix bas, articles variés du quotidien
+        reason.append(f"{total_items} articles, peu de feedback")
+
     if avg_price < 30 and normal_count > luxury_count * 3:
         score += 10
-        reason.append("profil dressing perso ✓")
- 
-    score = max(0, min(100, score))
- 
-    is_good = score >= 50
+        reason.append("dressing perso ✓")
+
+    score      = max(0, min(100, score))
+    is_good    = score >= 50
     reason_str = " | ".join(reason) if reason else "profil OK"
- 
+
     result = (is_good, score, reason_str)
-    seller_cache[seller_id] = result
+    seller_cache[cache_key] = result
     return result
- 
-# ════════════════════════════════════════════════════════
-#  🧠  ÉVALUATION ARTICLE
-# ════════════════════════════════════════════════════════
- 
+
+# ── Évaluation article ────────────────────────────────────
 def get_condition_coeff(condition_str):
     if not condition_str:
         return CONDITION_COEFFS["default"]
@@ -418,9 +427,9 @@ def get_condition_coeff(condition_str):
         if key in c:
             return coeff
     return CONDITION_COEFFS["default"]
- 
+
 def estimate_resell_value(title, description, brand_data):
-    text = (title + " " + (description or "")).lower()
+    text        = (title + " " + (description or "")).lower()
     best_retail = 0
     best_match  = None
     for model_key, retail_price in brand_data["retail"].items():
@@ -433,37 +442,37 @@ def estimate_resell_value(title, description, brand_data):
         best_retail = vals[len(vals) // 2]
         best_match  = "ref mediane"
     return best_retail * 0.50, best_retail, best_match
- 
+
 def evaluate_item(item, brand_name, brand_data):
     try:
         price       = float(item.get("price", {}).get("amount", 0))
         title       = item.get("title", "")
         description = item.get("description", "")
         condition   = item.get("status", "")
- 
+
         if price == 0 or price > BUDGET_MAX:
             return None
         if price < brand_data.get("min_price", 3):
             return None
- 
+
         text = (title + " " + (description or "")).lower()
         if any(s in text for s in FAKE_SIGNALS):
             return None
- 
+
         resell_base, retail_price, matched_model = estimate_resell_value(title, description, brand_data)
         coeff        = get_condition_coeff(condition)
         resell_value = round(resell_base * coeff, 0)
         ratio        = round(resell_value / price, 2) if price > 0 else 0
- 
+
         if ratio < RATIO_MIN:
             return None
- 
+
         vinted_fees = round(resell_value * 0.05 + 0.70, 2)
         net_gain    = round(resell_value - price - vinted_fees, 0)
- 
+
         if net_gain < MIN_GAIN:
             return None
- 
+
         return {
             "brand_name":   brand_name,
             "price":        price,
@@ -478,11 +487,8 @@ def evaluate_item(item, brand_name, brand_data):
     except Exception as e:
         print(f"  [ERREUR] evaluate_item : {e}")
         return None
- 
-# ════════════════════════════════════════════════════════
-#  📲  TELEGRAM
-# ════════════════════════════════════════════════════════
- 
+
+# ── Telegram ──────────────────────────────────────────────
 def send_telegram(message, photo_url=None):
     base = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
     if photo_url:
@@ -497,25 +503,25 @@ def send_telegram(message, photo_url=None):
     except Exception as e:
         print(f"[ERREUR] Telegram : {e}")
         return False
- 
-def format_alert(item, result, seller_score, seller_reason):
-    title   = item.get("title", "Sans titre")
-    url     = f"https://www.vinted.fr/items/{item.get('id', '')}"
-    seller  = item.get("user", {})
-    s_name  = seller.get("login", "?")
-    s_url   = f"https://www.vinted.fr/member/{seller.get('id', '')}"
-    fire    = "🔥" * min(int(result["ratio"]), 5)
- 
-    # Badge profil vendeur
+
+def format_alert(item, result, country_flag, seller_score, seller_reason, base_url):
+    title     = item.get("title", "Sans titre")
+    item_id   = item.get("id", "")
+    url       = f"{base_url}/items/{item_id}"
+    seller    = item.get("user", {})
+    s_name    = seller.get("login", "?")
+    s_url     = f"{base_url}/member/{seller.get('id', '')}"
+    fire      = "🔥" * min(int(result["ratio"]), 5)
+
     if seller_score >= 80:
         profile_badge = "🟢 Profil idéal"
     elif seller_score >= 60:
         profile_badge = "🟡 Profil correct"
     else:
-        profile_badge = "🟠 Profil à vérifier"
- 
+        profile_badge = "🟠 À vérifier"
+
     msg = (
-        f"{fire} <b>{result['brand_name'].upper()}</b>\n\n"
+        f"{fire} {country_flag} <b>{result['brand_name'].upper()}</b>\n\n"
         f"👕 <b>{title}</b>\n\n"
         f"💰 Prix demandé   : <b>{result['price']}€</b>\n"
         f"🏷️ Prix boutique  : ~{result['retail_price']}€\n"
@@ -524,89 +530,94 @@ def format_alert(item, result, seller_score, seller_reason):
         f"🤑 Gain net       : <b>+{result['net_gain']:.0f}€</b>\n\n"
         f"📐 Taille : {result['size']} | État : {result['condition']}\n"
         f"📍 {result['city']}\n\n"
-        f"{profile_badge} (score {seller_score}/100)\n"
+        f"{profile_badge} ({seller_score}/100)\n"
         f"👤 <a href=\"{s_url}\">{s_name}</a> — {seller_reason}\n\n"
         f"👉 <a href=\"{url}\">VOIR L'ANNONCE</a>\n"
         f"⏰ {datetime.now().strftime('%H:%M:%S')}"
     )
     return msg
- 
-# ════════════════════════════════════════════════════════
-#  🔄  BOUCLE PRINCIPALE
-# ════════════════════════════════════════════════════════
- 
+
+# ── Boucle principale ─────────────────────────────────────
 seen_ids = set()
- 
-def scan_all():
+
+def scan_country(country_name, base_url):
     found = 0
+    flag  = country_name.split()[0]  # Ex: "🇫🇷"
+
     for brand_name, brand_data in BRANDS.items():
         for keyword in brand_data["keywords"]:
-            items = search_vinted(keyword, max_price=BUDGET_MAX)
+            items = search_vinted_country(base_url, keyword, max_price=BUDGET_MAX)
+
             for item in items:
-                item_id = item.get("id")
-                if not item_id or item_id in seen_ids:
+                item_id   = item.get("id")
+                unique_id = f"{base_url}_{item_id}"
+                if not item_id or unique_id in seen_ids:
                     continue
-                seen_ids.add(item_id)
- 
-                # 1. Évaluation prix
+                seen_ids.add(unique_id)
+
                 result = evaluate_item(item, brand_name, brand_data)
                 if not result:
                     continue
- 
-                # 2. Analyse vendeur
+
                 seller    = item.get("user", {})
                 seller_id = seller.get("id")
                 if not seller_id:
                     continue
- 
-                is_good, score, reason = analyze_seller(seller_id)
+
+                is_good, score, reason = analyze_seller(base_url, seller_id)
                 if not is_good:
-                    print(f"  [SKIP] Vendeur suspect ({score}/100) : {reason}")
                     continue
- 
-                # 3. Alerte
+
                 photos    = item.get("photos", [])
                 photo_url = photos[0].get("url") or photos[0].get("full_size_url") if photos else None
-                msg       = format_alert(item, result, score, reason)
+                msg       = format_alert(item, result, flag, score, reason, base_url)
                 send_telegram(msg, photo_url=photo_url)
- 
+
                 print(
-                    f"[{datetime.now().strftime('%H:%M:%S')}] 🔥 {result['brand_name']} | "
-                    f"{item.get('title','?')[:35]} | {result['price']}€ → ~{result['resell_value']:.0f}€ "
-                    f"(x{result['ratio']}) | +{result['net_gain']:.0f}€ | vendeur {score}/100"
+                    f"[{datetime.now().strftime('%H:%M:%S')}] {flag} 🔥 "
+                    f"{result['brand_name']} | {item.get('title','?')[:35]} | "
+                    f"{result['price']}€ → ~{result['resell_value']:.0f}€ "
+                    f"(x{result['ratio']}) | +{result['net_gain']:.0f}€ | {score}/100"
                 )
                 found += 1
                 time.sleep(1)
- 
-            time.sleep(2)
+
+            time.sleep(1.5)
     return found
- 
+
 def main():
-    print("=" * 60)
-    print("   VINTED ALERT BOT — ANALYSE VENDEUR")
+    print("=" * 62)
+    print("   VINTED ALERT BOT — MULTI-PAYS")
+    print(f"   Pays       : {', '.join([c.split()[0] for c in VINTED_COUNTRIES])}")
     print(f"   Ratio min  : x{RATIO_MIN} | Gain min : +{MIN_GAIN}€")
     print(f"   Revente    : 50% prix boutique × coeff état")
-    print(f"   Vendeur    : score minimum 50/100")
     print(f"   Marques    : {len(BRANDS)}")
-    print("=" * 60)
- 
-    init_vinted_session()
- 
+    print("=" * 62)
+
+    init_all_sessions()
+
     send_telegram(
-        f"🤖 <b>Vinted Bot — Analyse Vendeur activée</b>\n\n"
+        f"🤖 <b>Vinted Bot — Multi-Pays activé !</b>\n\n"
+        f"🌍 Pays scannés : FR 🇫🇷 BE 🇧🇪 NL 🇳🇱 ES 🇪🇸 DE 🇩🇪 IT 🇮🇹\n"
         f"⚙️ Ratio : x{RATIO_MIN} | Gain min : +{MIN_GAIN}€\n"
-        f"👤 Filtre vendeur : profil dressing perso uniquement\n"
-        f"🚫 Revendeurs pros et contrefaçons exclus automatiquement\n\n"
-        f"🟢 En chasse..."
+        f"👤 Filtre vendeur actif\n"
+        f"📦 {len(BRANDS)} marques surveillées\n\n"
+        f"🟢 En chasse sur 6 pays..."
     )
- 
+
     cycle = 0
     while True:
         cycle += 1
-        print(f"\n── SCAN #{cycle} ── {datetime.now().strftime('%H:%M:%S')} ──")
-        found = scan_all()
-        print(f"── FIN #{cycle} ── {found} alerte(s) | Cache vendeurs : {len(seller_cache)} | Prochain dans {CHECK_INTERVAL}s")
+        total = 0
+        print(f"\n══ SCAN #{cycle} ══ {datetime.now().strftime('%H:%M:%S')} ══")
+        for country_name, base_url in VINTED_COUNTRIES.items():
+            print(f"\n  {country_name}...")
+            found  = scan_country(country_name, base_url)
+            total += found
+            print(f"  {country_name} → {found} alerte(s)")
+            time.sleep(3)
+        print(f"\n══ FIN #{cycle} ══ {total} alerte(s) total | Cache : {len(seller_cache)} vendeurs | Prochain dans {CHECK_INTERVAL}s")
         time.sleep(CHECK_INTERVAL)
- 
+
 if __name__ == "__main__":
     main()
