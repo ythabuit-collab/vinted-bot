@@ -21,6 +21,10 @@ VINTED_COUNTRIES = {
     "🇮🇹 Italie":    "https://www.vinted.it",
 }
 
+# ════════════════════════════════════════════════════════
+#  ⚡  FRAÎCHEUR
+# ════════════════════════════════════════════════════════
+
 def get_freshness(item):
     try:
         ts = item.get("created_at_ts") or item.get("photo", {}).get("created_at_ts")
@@ -35,6 +39,10 @@ def get_freshness(item):
         return age_min, label, is_fresh
     except:
         return None, "?", False
+
+# ════════════════════════════════════════════════════════
+#  📊  LIQUIDITÉ
+# ════════════════════════════════════════════════════════
 
 LIQUID_SIZES = {
     "xs": 3, "s": 5, "m": 5, "l": 4, "xl": 3, "xxl": 2,
@@ -69,57 +77,291 @@ def liq_label(score):
     elif score >= 2.5: return "🟡 Moyen (semaines)"
     else: return "🔴 Lent (mois)"
 
+# ════════════════════════════════════════════════════════
+#  💰  EXTRACTION MODÈLE PRÉCIS DEPUIS LE TITRE
+# ════════════════════════════════════════════════════════
+
+def extract_search_query(title, brand_name):
+    """
+    Extrait une requête de recherche précise depuis le titre Vinted.
+    Garde les mots significatifs : modèle, couleur, matière, taille.
+    """
+    # Mots à ignorer (articles, prépositions, mots génériques)
+    stop_words = {
+        "le", "la", "les", "de", "du", "des", "un", "une", "en", "et",
+        "avec", "pour", "très", "bon", "etat", "état", "neuf", "occasion",
+        "vente", "vends", "taille", "couleur", "belle", "beau", "super",
+        "the", "a", "an", "in", "of", "for", "and", "with", "size",
+        "condition", "used", "new", "good", "great", "nice", "worn"
+    }
+
+    words = title.lower().split()
+    significant = [w for w in words if len(w) > 2 and w not in stop_words]
+
+    # Prend les 5 mots les plus significatifs
+    query = f"{brand_name} {' '.join(significant[:5])}"
+    return query.strip()
+
+# ════════════════════════════════════════════════════════
+#  💰  SOURCE 1 : EBAY — dernières ventes réelles
+# ════════════════════════════════════════════════════════
+
 ebay_cache = {}
-EBAY_SESSION = requests.Session()
-EBAY_SESSION.headers.update({
+SCRAPE_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
     "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
     "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
-})
+}
 
-def search_ebay_sold(brand_name, title, item_type=""):
-    title_words = [w for w in title.split() if len(w) > 3][:4]
-    query       = f"{brand_name} {' '.join(title_words)}".strip()
-    cache_key   = query.lower().replace(" ", "_")[:60]
-    now         = time.time()
+def search_ebay(brand_name, title):
+    query     = extract_search_query(title, brand_name)
+    cache_key = query.lower().replace(" ", "_")[:60]
+    now       = time.time()
+
     if cache_key in ebay_cache:
         t, d = ebay_cache[cache_key]
         if now - t < 3600: return d
 
-    def extract_prices(html):
+    def parse_prices(html):
         prices = []
         for p in re.findall(r'([\d]+[,.][\d]{2})\s*EUR', html):
             try:
                 v = float(p.replace(",", "."))
-                if 5 < v < 5000: prices.append(v)
+                if 5 < v < 8000: prices.append(v)
             except: pass
         return prices
 
     try:
+        # Recherche 1 : requête précise avec titre
         params = {"_nkw": query, "LH_Sold": "1", "LH_Complete": "1", "_sop": "13", "_ipg": "60"}
-        r = EBAY_SESSION.get("https://www.ebay.fr/sch/i.html", params=params, timeout=12)
-        prices = extract_prices(r.text) if r.status_code == 200 else []
+        r      = requests.get("https://www.ebay.fr/sch/i.html", params=params,
+                              headers=SCRAPE_HEADERS, timeout=12)
+        prices = parse_prices(r.text) if r.status_code == 200 else []
+
+        # Recherche 2 : fallback avec juste la marque + type
+        if len(prices) < 5:
+            item_type = _detect_type_from_title(title)
+            params2   = dict(params)
+            params2["_nkw"] = f"{brand_name} {item_type}".strip()
+            r2 = requests.get("https://www.ebay.fr/sch/i.html", params=params2,
+                              headers=SCRAPE_HEADERS, timeout=12)
+            if r2.status_code == 200:
+                prices += parse_prices(r2.text)
+
         if len(prices) < 3:
-            params2 = dict(params); params2["_nkw"] = f"{brand_name} {item_type}".strip()
-            r2 = EBAY_SESSION.get("https://www.ebay.fr/sch/i.html", params=params2, timeout=12)
-            if r2.status_code == 200: prices += extract_prices(r2.text)
-        if len(prices) < 3:
-            result = (None, 0, "indisponible"); ebay_cache[cache_key] = (now, result); return result
+            result = (None, 0, "faible")
+            ebay_cache[cache_key] = (now, result)
+            return result
+
         prices.sort()
-        cut    = max(1, len(prices) // 20)
+        cut    = max(1, len(prices) // 10)
         prices = prices[cut:-cut] if len(prices) > 10 else prices
         median = prices[len(prices) // 2]
         avg    = sum(prices) / len(prices)
-        price  = round(median * 0.6 + avg * 0.4, 0)
+        price  = round(median * 0.65 + avg * 0.35, 0)
         n      = len(prices)
         conf   = "haute" if n >= 20 else "moyenne" if n >= 8 else "faible"
+
         result = (price, n, conf)
         ebay_cache[cache_key] = (now, result)
-        print(f"  [eBay] '{query[:40]}' -> {price}€ ({n} ventes, {conf})")
+        print(f"  [eBay] '{query[:35]}' → {price}€ ({n} ventes, {conf})")
         return result
     except Exception as e:
         print(f"  [eBay] Erreur: {e}")
-        result = (None, 0, "indisponible"); ebay_cache[cache_key] = (now, result); return result
+        result = (None, 0, "faible")
+        ebay_cache[cache_key] = (now, result)
+        return result
+
+def _detect_type_from_title(title):
+    tl = title.lower()
+    for t in ["veste", "jacket", "hoodie", "pull", "sweat", "tshirt", "t-shirt",
+              "jean", "pantalon", "sac", "bag", "sneaker", "boot", "manteau",
+              "polo", "chemise", "shirt", "gilet", "parka", "doudoune"]:
+        if t in tl: return t
+    return ""
+
+# ════════════════════════════════════════════════════════
+#  💰  SOURCE 2 : VESTIAIRE COLLECTIVE — luxe uniquement
+# ════════════════════════════════════════════════════════
+
+vestiaire_cache = {}
+
+LUXURY_BRANDS_VESTIAIRE = [
+    "Bottega Veneta", "Balenciaga", "Gucci", "Prada", "Burberry",
+    "Louis Vuitton", "Dior", "Stone Island", "Ami Paris", "Jacquemus",
+    "APC", "Zadig Voltaire", "Moncler", "Canada Goose", "CP Company",
+    "Saint Laurent", "Celine", "Givenchy", "Valentino", "Fendi",
+]
+
+def search_vestiaire(brand_name, title):
+    if brand_name not in LUXURY_BRANDS_VESTIAIRE:
+        return None, 0, "non applicable"
+
+    query     = extract_search_query(title, brand_name)
+    cache_key = f"vest_{query.lower().replace(' ', '_')[:50]}"
+    now       = time.time()
+
+    if cache_key in vestiaire_cache:
+        t, d = vestiaire_cache[cache_key]
+        if now - t < 7200: return d
+
+    try:
+        search_url = "https://fr.vestiairecollective.com/search/"
+        params     = {"q": query, "order": "price_asc"}
+        r = requests.get(search_url, params=params,
+                         headers=SCRAPE_HEADERS, timeout=12)
+
+        if r.status_code != 200:
+            result = (None, 0, "indisponible")
+            vestiaire_cache[cache_key] = (now, result)
+            return result
+
+        # Extraction des prix
+        prices_raw = re.findall(r'(\d{2,5})[,.]?\d{0,2}\s*€', r.text)
+        prices = []
+        for p in prices_raw:
+            try:
+                v = float(p)
+                if 20 < v < 10000: prices.append(v)
+            except: pass
+
+        if len(prices) < 3:
+            result = (None, 0, "faible")
+            vestiaire_cache[cache_key] = (now, result)
+            return result
+
+        prices.sort()
+        # Sur Vestiaire on prend le prix médian des 10 premiers résultats
+        prices  = prices[:10]
+        median  = prices[len(prices) // 2]
+        result  = (round(median, 0), len(prices), "haute")
+        vestiaire_cache[cache_key] = (now, result)
+        print(f"  [Vestiaire] '{query[:35]}' → {median}€ ({len(prices)} résultats)")
+        return result
+    except Exception as e:
+        print(f"  [Vestiaire] Erreur: {e}")
+        result = (None, 0, "indisponible")
+        vestiaire_cache[cache_key] = (now, result)
+        return result
+
+# ════════════════════════════════════════════════════════
+#  💰  SOURCE 3 : STOCKX — sneakers & streetwear
+# ════════════════════════════════════════════════════════
+
+stockx_cache = {}
+
+STOCKX_BRANDS = ["Nike Jordan", "Adidas", "Balenciaga", "Gucci", "Dior", "Louis Vuitton"]
+
+def search_stockx(brand_name, title):
+    if brand_name not in STOCKX_BRANDS:
+        return None, 0, "non applicable"
+
+    query     = extract_search_query(title, brand_name)
+    cache_key = f"stx_{query.lower().replace(' ', '_')[:50]}"
+    now       = time.time()
+
+    if cache_key in stockx_cache:
+        t, d = stockx_cache[cache_key]
+        if now - t < 3600: return d
+
+    try:
+        # StockX search via leur page publique
+        r = requests.get(
+            f"https://stockx.com/search?s={requests.utils.quote(query)}",
+            headers={**SCRAPE_HEADERS, "Accept-Language": "en-US,en;q=0.9"},
+            timeout=12
+        )
+
+        if r.status_code != 200:
+            result = (None, 0, "indisponible")
+            stockx_cache[cache_key] = (now, result)
+            return result
+
+        # Extraction prix "last sale"
+        prices_raw = re.findall(r'\$(\d{2,4})', r.text)
+        prices = []
+        for p in prices_raw:
+            try:
+                v = float(p) * 0.92  # Conversion USD → EUR approximative
+                if 30 < v < 3000: prices.append(v)
+            except: pass
+
+        if len(prices) < 2:
+            result = (None, 0, "faible")
+            stockx_cache[cache_key] = (now, result)
+            return result
+
+        prices.sort()
+        median = prices[len(prices) // 2]
+        result = (round(median, 0), len(prices), "moyenne")
+        stockx_cache[cache_key] = (now, result)
+        print(f"  [StockX] '{query[:35]}' → {median}€ ({len(prices)} résultats)")
+        return result
+    except Exception as e:
+        print(f"  [StockX] Erreur: {e}")
+        result = (None, 0, "indisponible")
+        stockx_cache[cache_key] = (now, result)
+        return result
+
+# ════════════════════════════════════════════════════════
+#  🧠  FUSION MULTI-SOURCES + SCORE DE CONFIANCE
+# ════════════════════════════════════════════════════════
+
+def fuse_prices(ebay_data, vestiaire_data, stockx_data, catalogue_price):
+    """
+    Fusionne les prix de toutes les sources disponibles.
+    Retourne (prix_final, score_confiance, detail_sources)
+    """
+    sources       = []
+    prices_valid  = []
+    sources_used  = []
+    conf_score    = 0
+
+    # eBay
+    ebay_price, ebay_n, ebay_conf = ebay_data
+    if ebay_price and ebay_conf in ("haute", "moyenne"):
+        weight = 3 if ebay_conf == "haute" else 2
+        prices_valid.append((ebay_price, weight))
+        sources_used.append(f"eBay ({ebay_n} ventes)")
+        conf_score += weight
+
+    # Vestiaire Collective
+    vest_price, vest_n, vest_conf = vestiaire_data
+    if vest_price and vest_conf == "haute":
+        prices_valid.append((vest_price, 3))
+        sources_used.append(f"Vestiaire ({vest_n} résultats)")
+        conf_score += 3
+
+    # StockX
+    stx_price, stx_n, stx_conf = stockx_data
+    if stx_price and stx_conf in ("haute", "moyenne"):
+        prices_valid.append((stx_price, 2))
+        sources_used.append(f"StockX ({stx_n} prix)")
+        conf_score += 2
+
+    # Si aucune source externe fiable → catalogue
+    if not prices_valid:
+        return catalogue_price, 1, ["catalogue (prix fixe)"]
+
+    # Moyenne pondérée
+    total_weight = sum(w for _, w in prices_valid)
+    weighted_avg = sum(p * w for p, w in prices_valid) / total_weight
+    final_price  = round(weighted_avg, 0)
+
+    # Score confiance max 10
+    conf_score = min(10, conf_score)
+
+    return final_price, conf_score, sources_used
+
+def confidence_label(score):
+    if score >= 7:   return "🟢 Élevée"
+    elif score >= 4: return "🟡 Moyenne"
+    elif score >= 2: return "🟠 Faible"
+    else:            return "⚪ Catalogue"
+
+# ════════════════════════════════════════════════════════
+#  🏷️  MARQUES & CATALOGUE
+# ════════════════════════════════════════════════════════
 
 MAX_LUXURY_RATIO   = 0.30
 MAX_AVG_PRICE      = 80
@@ -251,6 +493,10 @@ BRANDS = {
 
 FAKE_SIGNALS = ["replica", "rep", "aaa", "inspired", "no name", "contrefacon"]
 
+# ════════════════════════════════════════════════════════
+#  📡  SESSIONS VINTED
+# ════════════════════════════════════════════════════════
+
 country_sessions = {}
 
 def get_session(base_url):
@@ -269,8 +515,8 @@ def get_session(base_url):
 
 def init_all_sessions():
     for country, url in VINTED_COUNTRIES.items():
-        try: get_session(url); print(f"  {country} OK")
-        except Exception as e: print(f"  {country} ERREUR ({e})")
+        try: get_session(url); print(f"  {country} ✓")
+        except Exception as e: print(f"  {country} ✗ ({e})")
         time.sleep(0.8)
 
 def search_vinted(base_url, keyword, max_price=None):
@@ -284,6 +530,10 @@ def search_vinted(base_url, keyword, max_price=None):
         return []
     except Exception as e:
         print(f"  [{base_url.split('.')[-1]}] '{keyword}': {e}"); return []
+
+# ════════════════════════════════════════════════════════
+#  👤  ANALYSE VENDEUR
+# ════════════════════════════════════════════════════════
 
 seller_cache = {}
 
@@ -300,14 +550,18 @@ def analyze_seller(base_url, seller_id):
                    params={"per_page": 20, "order": "newest_first"}, timeout=10)
         if r2.status_code == 200: items = r2.json().get("items", [])
     except:
-        result = (True, 60, "profil non disponible"); seller_cache[key] = result; return result
+        result = (True, 60, "profil non disponible")
+        seller_cache[key] = result; return result
+
     if not items:
-        result = (True, 60, "historique vide"); seller_cache[key] = result; return result
+        result = (True, 60, "historique vide")
+        seller_cache[key] = result; return result
 
     feedback  = float(profile.get("feedback_reputation", 1) or 1)
     n_items   = int(profile.get("items_count", 0) or 0)
     n_fb      = int(profile.get("positive_feedback_count", 0) or 0)
     prices, lux, norm = [], 0, 0
+
     for it in items:
         try:
             p = float(it.get("price", {}).get("amount", 0))
@@ -316,18 +570,24 @@ def analyze_seller(base_url, seller_id):
             else: norm += 1
         except: pass
 
-    avg_p = sum(prices) / len(prices) if prices else 0
-    lux_r = lux / len(items) if items else 0
+    avg_p   = sum(prices) / len(prices) if prices else 0
+    lux_r   = lux / len(items) if items else 0
     score, reason = 100, []
+
     if feedback < MIN_FEEDBACK_SCORE:   score -= 40; reason.append(f"note {feedback}/5")
     if lux_r > MAX_LUXURY_RATIO:        score -= 50; reason.append(f"{int(lux_r*100)}% luxe")
     if avg_p > MAX_AVG_PRICE:           score -= 20; reason.append(f"prix moy. {avg_p:.0f}€")
     if n_items > 50 and n_fb < 5:       score -= 30; reason.append("peu de feedback")
-    if avg_p < 30 and norm > lux * 3:   score += 10; reason.append("dressing perso")
+    if avg_p < 30 and norm > lux * 3:   score += 10; reason.append("dressing perso ✓")
+
     score  = max(0, min(100, score))
     result = (score >= 50, score, " | ".join(reason) if reason else "profil OK")
     seller_cache[key] = result
     return result
+
+# ════════════════════════════════════════════════════════
+#  🧠  ÉVALUATION ARTICLE — MULTI-SOURCES
+# ════════════════════════════════════════════════════════
 
 def get_cond_coeff(cond):
     if not cond: return CONDITION_COEFFS["default"]
@@ -347,14 +607,6 @@ def get_catalogue_resell(title, desc, brand_data):
         best_retail = vals[len(vals) // 2]; best_match = "ref mediane"
     return best_retail * 0.50, best_retail, best_match
 
-def detect_type(title, brand_data):
-    tl = title.lower()
-    for mk in brand_data["retail"]:
-        if all(w in tl for w in mk.split()): return mk
-    for t in ["veste", "hoodie", "pull", "tshirt", "jean", "sac", "sneaker", "boot", "manteau"]:
-        if t in tl: return t
-    return ""
-
 def evaluate_item(item, brand_name, brand_data):
     try:
         price = float(item.get("price", {}).get("amount", 0))
@@ -363,46 +615,72 @@ def evaluate_item(item, brand_name, brand_data):
         cond  = item.get("status", "")
         size  = item.get("size_title", "?")
         city  = item.get("city", "?")
+
         if price == 0 or price > BUDGET_MAX: return None
         if price < brand_data.get("min_price", 3): return None
         if any(s in (title + " " + (desc or "")).lower() for s in FAKE_SIGNALS): return None
 
+        # ── Prix catalogue (base) ──
         cat_resell, retail_price, _ = get_catalogue_resell(title, desc, brand_data)
-        itype                        = detect_type(title, brand_data)
-        ebay_price, n_sales, conf    = search_ebay_sold(brand_name, title, itype)
+
+        # ── 3 sources externes ──
+        ebay_data      = search_ebay(brand_name, title)
+        time.sleep(0.5)
+        vestiaire_data = search_vestiaire(brand_name, title)
+        time.sleep(0.3)
+        stockx_data    = search_stockx(brand_name, title)
         time.sleep(0.3)
 
-        if ebay_price and conf in ("haute", "moyenne"):
-            resell_base = ebay_price
-            src         = f"eBay ({n_sales} ventes, {conf})"
-        else:
-            resell_base = cat_resell
-            src         = "catalogue"
+        # ── Fusion des prix ──
+        fused_price, conf_score, sources_used = fuse_prices(
+            ebay_data, vestiaire_data, stockx_data, cat_resell
+        )
 
+        # ── Application coefficient état ──
         coeff  = get_cond_coeff(cond)
-        resell = round(resell_base * coeff, 0)
+        resell = round(fused_price * coeff, 0)
         ratio  = round(resell / price, 2) if price > 0 else 0
+
         if ratio < RATIO_MIN: return None
-        fees   = round(resell * 0.05 + 0.70, 2)
-        gain   = round(resell - price - fees, 0)
+
+        fees = round(resell * 0.05 + 0.70, 2)
+        gain = round(resell - price - fees, 0)
         if gain < MIN_GAIN: return None
+
         liq = compute_liquidity(title, size, cond)
+
         return {
-            "brand": brand_name, "price": price, "retail": retail_price,
-            "resell": resell, "gain": gain, "ratio": ratio,
-            "cond": cond, "size": size, "city": city,
-            "src": src, "liq": liq, "liq_label": liq_label(liq),
+            "brand":        brand_name,
+            "price":        price,
+            "retail":       retail_price,
+            "resell":       resell,
+            "gain":         gain,
+            "ratio":        ratio,
+            "cond":         cond,
+            "size":         size,
+            "city":         city,
+            "sources":      sources_used,
+            "conf_score":   conf_score,
+            "conf_label":   confidence_label(conf_score),
+            "liq":          liq,
+            "liq_label":    liq_label(liq),
         }
     except Exception as e:
         print(f"  [ERREUR] {e}"); return None
 
+# ════════════════════════════════════════════════════════
+#  📲  TELEGRAM
+# ════════════════════════════════════════════════════════
+
 def send_telegram(msg, photo_url=None):
     base = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
     if photo_url:
-        payload  = {"chat_id": TELEGRAM_CHAT_ID, "photo": photo_url, "caption": msg[:1024], "parse_mode": "HTML"}
+        payload  = {"chat_id": TELEGRAM_CHAT_ID, "photo": photo_url,
+                    "caption": msg[:1024], "parse_mode": "HTML"}
         endpoint = f"{base}/sendPhoto"
     else:
-        payload  = {"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML", "disable_web_page_preview": False}
+        payload  = {"chat_id": TELEGRAM_CHAT_ID, "text": msg,
+                    "parse_mode": "HTML", "disable_web_page_preview": False}
         endpoint = f"{base}/sendMessage"
     try:
         r = requests.post(endpoint, json=payload, timeout=10)
@@ -416,30 +694,41 @@ def format_alert(item, r, flag, s_score, s_reason, base_url, age_min, fresh_labe
     seller = item.get("user", {})
     s_url  = f"{base_url}/member/{seller.get('id', '')}"
     fire   = "🔥" * min(int(r["ratio"]), 5)
+
     if is_fresh and age_min is not None and age_min <= 5: header = f"🚨 URGENT — {fresh_label}\n"
-    elif is_fresh: header = f"⚡ RECENT — {fresh_label}\n"
+    elif is_fresh: header = f"⚡ RÉCENT — {fresh_label}\n"
     else: header = ""
-    if s_score >= 80:   badge = "🟢 Profil ideal"
+
+    if s_score >= 80:   badge = "🟢 Profil idéal"
     elif s_score >= 60: badge = "🟡 Profil correct"
-    else:               badge = "🟠 A verifier"
+    else:               badge = "🟠 À vérifier"
+
+    # Sources utilisées
+    sources_str = " + ".join(r["sources"]) if r["sources"] else "catalogue"
+
     return (
         f"{header}{fire} {flag} <b>{r['brand'].upper()}</b>\n\n"
         f"👕 <b>{title}</b>\n\n"
-        f"💰 Prix demande   : <b>{r['price']}€</b>\n"
+        f"💰 Prix demandé   : <b>{r['price']}€</b>\n"
         f"🏷️ Prix boutique  : ~{r['retail']}€\n"
-        f"💵 Revente estimee: ~{r['resell']:.0f}€\n"
-        f"📊 Source prix    : {r['src']}\n"
+        f"💵 Revente estimée: ~{r['resell']:.0f}€\n"
+        f"📊 Sources        : {sources_str}\n"
+        f"🎯 Confiance      : {r['conf_label']} ({r['conf_score']}/10)\n"
         f"📈 Ratio          : <b>x{r['ratio']}</b>\n"
         f"🤑 Gain net       : <b>+{r['gain']:.0f}€</b>\n\n"
-        f"⚡ Liquidite      : {r['liq_label']} ({r['liq']}/5)\n"
+        f"⚡ Liquidité      : {r['liq_label']} ({r['liq']}/5)\n"
         f"🕐 Annonce        : {fresh_label}\n"
-        f"📐 Taille : {r['size']} | Etat : {r['cond']}\n"
+        f"📐 Taille : {r['size']} | État : {r['cond']}\n"
         f"📍 {r['city']}\n\n"
         f"{badge} ({s_score}/100)\n"
         f"👤 <a href=\"{s_url}\">{seller.get('login','?')}</a> — {s_reason}\n\n"
         f"👉 <a href=\"{url}\">VOIR L'ANNONCE</a>\n"
         f"⏰ {datetime.now().strftime('%H:%M:%S')}"
     )
+
+# ════════════════════════════════════════════════════════
+#  🔄  BOUCLE PRINCIPALE
+# ════════════════════════════════════════════════════════
 
 seen_ids = set()
 
@@ -454,24 +743,30 @@ def scan_country(country_name, base_url):
                 unique_id = f"{base_url}_{item_id}"
                 if not item_id or unique_id in seen_ids: continue
                 seen_ids.add(unique_id)
+
                 result = evaluate_item(item, brand_name, brand_data)
                 if not result: continue
+
                 seller_id = item.get("user", {}).get("id")
                 if not seller_id: continue
+
                 is_good, score, reason = analyze_seller(base_url, seller_id)
                 if not is_good: continue
+
                 age_min, fresh_label, is_fresh = get_freshness(item)
                 photos    = item.get("photos", [])
                 photo_url = photos[0].get("url") or photos[0].get("full_size_url") if photos else None
-                msg       = format_alert(item, result, flag, score, reason, base_url, age_min, fresh_label, is_fresh)
+                msg       = format_alert(item, result, flag, score, reason,
+                                         base_url, age_min, fresh_label, is_fresh)
                 send_telegram(msg, photo_url=photo_url)
+
                 print(
                     f"[{datetime.now().strftime('%H:%M:%S')}] {flag}"
                     f"{'🚨' if is_fresh else '  '} {result['brand']} | "
-                    f"{item.get('title','?')[:28]} | "
-                    f"{result['price']}€->{result['resell']:.0f}€ "
+                    f"{item.get('title','?')[:25]} | "
+                    f"{result['price']}€→{result['resell']:.0f}€ "
                     f"x{result['ratio']} +{result['gain']:.0f}€ "
-                    f"liq:{result['liq']} {age_min}min"
+                    f"conf:{result['conf_score']}/10 liq:{result['liq']}"
                 )
                 found += 1
                 time.sleep(1)
@@ -480,26 +775,26 @@ def scan_country(country_name, base_url):
 
 def main():
     print("=" * 65)
-    print("   VINTED ALERT BOT — VERSION FINALE")
-    print(f"   Fraicheur  : urgence si < {FRESH_MINUTES} min")
-    print(f"   eBay       : requete precise par article, cache 1h")
-    print(f"   Liquidite  : score taille + couleur + etat")
-    print(f"   Vendeur    : filtre dressing perso")
-    print(f"   Ratio min  : x{RATIO_MIN} | Gain min : +{MIN_GAIN}€")
-    print(f"   Pays       : {len(VINTED_COUNTRIES)} | Marques : {len(BRANDS)}")
+    print("   VINTED BOT — MULTI-SOURCES PRIX")
+    print(f"   Prix    : eBay + Vestiaire + StockX + catalogue")
+    print(f"   Confiance : score /10 selon nb sources confirmées")
+    print(f"   Ratio min : x{RATIO_MIN} | Gain min : +{MIN_GAIN}€")
+    print(f"   Pays    : {len(VINTED_COUNTRIES)} | Marques : {len(BRANDS)}")
     print("=" * 65)
-    print("\n[INFO] Init sessions...")
+
     init_all_sessions()
+
     send_telegram(
-        f"🤖 <b>Vinted Bot — VERSION FINALE</b>\n\n"
-        f"🆕 Fraicheur annonce (urgence &lt; {FRESH_MINUTES}min)\n"
-        f"💰 Prix eBay precis par article, cache 1h\n"
-        f"⚡ Score liquidite taille/couleur/etat\n"
-        f"👤 Filtre profil vendeur\n"
-        f"🌍 6 pays | 📦 {len(BRANDS)} marques\n"
-        f"⚙️ Ratio x{RATIO_MIN} | Gain min +{MIN_GAIN}€\n\n"
+        f"🤖 <b>Vinted Bot — Multi-Sources activé</b>\n\n"
+        f"💰 Prix vérifiés sur 3 sources :\n"
+        f"• eBay (dernières ventes réelles)\n"
+        f"• Vestiaire Collective (luxe)\n"
+        f"• StockX (sneakers & streetwear)\n\n"
+        f"🎯 Score de confiance /10 par alerte\n"
+        f"🌍 6 pays | 📦 {len(BRANDS)} marques\n\n"
         f"🟢 En chasse..."
     )
+
     cycle = 0
     while True:
         cycle += 1
@@ -510,7 +805,7 @@ def main():
             found  = scan_country(country_name, base_url)
             total += found
             time.sleep(3)
-        print(f"\n══ FIN #{cycle} ══ {total} alerte(s) | eBay:{len(ebay_cache)} | Vendeurs:{len(seller_cache)} | Next:{CHECK_INTERVAL}s")
+        print(f"\n══ FIN #{cycle} ══ {total} alerte(s) | eBay:{len(ebay_cache)} Vest:{len(vestiaire_cache)} STX:{len(stockx_cache)} | Next:{CHECK_INTERVAL}s")
         time.sleep(CHECK_INTERVAL)
 
 if __name__ == "__main__":
